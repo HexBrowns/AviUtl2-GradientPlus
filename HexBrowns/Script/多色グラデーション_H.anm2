@@ -1,4 +1,4 @@
---information:多色グラデーション_H v1.03 by HexBrowns
+--information:多色グラデーション_H v1.10 by HexBrowns
 --label:HexScript
 --track@strength:強さ,0,100,100,0.1
 --track@center_x:中心X,-5000,5000,0,0.1
@@ -41,8 +41,10 @@
 --track@gradient_pct:幅(%),0,1000,100,0.1
 --hide@gradient_w:w_basis==1
 --hide@gradient_pct:w_basis==0
+--track@grad_steps:段数(0で連続),0,256,0,1
+--select@grad_dither:ディザ=0,なし=0,Bayer=1,ノイズ=2
 
--- 多色グラデーション_H v1.03
+-- 多色グラデーション_H v1.10
 --
 -- 原作: グラデーション+ v1.1.0 by azurite（Script/グラデーション+.anm2、CC0-1.0）。
 -- CC0 なので改変・再配布の制約は無い。原作のファイルはそのまま残してある。
@@ -74,10 +76,18 @@
 --      中心X / 中心Y は画素のまま。ピクセルのときにシェーダーへ渡す定数は v1.01 と同じ
 --   7. v1.03: 元の素材の退避（cache）を 1 つの名前にし、読み終えたら縮める。テキストを並べたグループ制御に
 --      掛けて描き直すと退避が消えて invalid buffer type になっていた（ps_restore の前の説明）
+--   8. v1.10: 段数(0で連続) / ディザ を足した（図形グラデーション_H v2.10 と同じ項目名・同じ式）。
+--      段数 n（2 以上）で、形状が作る 0〜100% の位置を n 等分し、段 k（0..n-1）を位置 k/(n-1) の色で塗る
+--      （最初の段は開始色、最後の段は終了色。色ではなく位置を区切るので、どの色空間でも各段はその色空間の
+--      グラデーションの色になる）。0 と 1 は今までどおりの連続。
+--      ディザは段の中心どうしの間で隣の段を混ぜる（混ぜる割合は位置に比例。Bayer は 8x8 の組織的ディザ、
+--      ノイズは画素ごとのハッシュ。どちらもオブジェクトの画素の位置で決まる）。段数が 0 / 1 のときは効かない
+--      （トラックは --hide@ の条件に書けないので隠していない）
 --
 -- 互換（保存キー）
 --   原作の項目名（強さ〜終了色透明度）と、合成モード / 形状 / 色空間 / 補間経路の
---   選択肢のラベルは 1 文字も変えていない。新しい項目は末尾に足した（v1.02 の 幅の基準 / 幅(%) も末尾）。
+--   選択肢のラベルは 1 文字も変えていない。新しい項目は末尾に足した（v1.02 の 幅の基準 / 幅(%)、
+--   v1.10 の 段数(0で連続) / ディザ も末尾。既定の 0 / なし で v1.03 と同じ絵）。
 --   .aup2 の effect.name=グラデーション+ を effect.name=多色グラデーション_H に
 --   書き換えれば、原作の設定値がそのまま読める（色数は既定の 2色 になる）。
 --   2 色のときにシェーダーへ渡る定数の先頭 22 個は原作と同じで、区間は常に
@@ -548,6 +558,42 @@ float grad_round_square_loop(float2 uv, float w) {
     dist = fmod(dist + w, 2.0 * w) - w;
     return linstep(0.0, w, abs(dist));
 }
+
+// ---- [v1.10 から] 段数とディザ（正本: 図形グラデーション_H の ps_sg_main。変えるときは両方を直す）----
+// 段数 n（2 以上）: 位置 u を n 等分し、段 k（0..n-1）を位置 k/(n-1) にする（色ではなく位置を区切る）。
+// ディザ: 段の番号 = floor(u x n - 0.5 + しきい値)。段の中心（u x n - 0.5 が整数）では混ざらず、
+// 中心どうしの間で隣の段の割合が位置に比例して増える。なしは floor(u x n)（等幅の段）
+uint grad_pcg_hash(uint v) {
+    uint state = v * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+// しきい値（0..1）。1 = Bayer 8x8、2 = ノイズ（画素ごとの PCG ハッシュの上位 24 ビット）、それ以外は 0.5
+float grad_dither_threshold(uint2 ip, float mode) {
+    float thr = 0.5;
+    if (mode > 1.5) {
+        thr = (float)(grad_pcg_hash(ip.x + grad_pcg_hash(ip.y)) >> 8u) / 16777216.0;
+    } else if (mode > 0.5) {
+        uint x = ip.x & 7u;
+        uint y = ip.y & 7u;
+        uint xy = x ^ y;
+        uint m = ((xy & 1u) << 5u) | ((y & 1u) << 4u) | ((xy & 2u) << 2u) | ((y & 2u) << 1u)
+               | ((xy & 4u) >> 1u) | ((y & 4u) >> 2u);
+        thr = ((float)m + 0.5) / 64.0;
+    }
+    return thr;
+}
+
+float grad_quantize(float u, float n, float mode, float thr) {
+    float r = u;
+    if (n > 1.5) {
+        float lv = mode > 0.5 ? floor(u * n - 0.5 + thr) : floor(u * n);
+        r = clamp(lv, 0.0, n - 1.0) / (n - 1.0);
+    }
+    return r;
+}
+// ---- [v1.10 まで] ----
 Texture2D<float4> src : register(t0);
 cbuffer constant0 : register(b0) {
     // ---- 0..21 は原作と同じ並び（Lua の配列の先頭 22 個も原作と同じ）----
@@ -567,6 +613,8 @@ cbuffer constant0 : register(b0) {
     float4 color_mid2;    // 28-31  中間色2
     float4 color_mid3;    // 32-35  中間色3
     float stop3;          // 36     中間色3の位置
+    float step_count;     // 37     [v1.10] 段数（2 未満は連続）
+    float dither_mode;    // 38     [v1.10] ディザ（0 なし / 1 Bayer / 2 ノイズ）
 };
 
 float4 ps_gradient(float4 pos : SV_Position) : SV_Target {
@@ -607,6 +655,11 @@ float4 ps_gradient(float4 pos : SV_Position) : SV_Target {
             u = grad_line(st, gradient_w);
             break;
     }
+
+    // [v1.10] 段数とディザ: 位置 u を段に区切ってから区間を探す
+    if (step_count > 1.5) {  // [v1.10]
+        u = grad_quantize(u, step_count, dither_mode, grad_dither_threshold(uint2(pos.xy), dither_mode));  // [v1.10]
+    }  // [v1.10]
 
     // ---- 区間の探索 ----
     // 使わない中間色は Lua 側で「終了色・位置 1」に詰めてある。u は 1 を超えないので
@@ -910,7 +963,7 @@ obj.copybuffer(cache_name, "object")
 obj.pixelshader("ps_opaque", "object", { "object" }, {}, "copy")
 obj.draw()
 
--- 先頭 22 個は原作と同じ並び。22 以降は cbuffer の stop1 .. stop3（穴なし）
+-- 先頭 22 個は原作と同じ並び。22 以降は cbuffer の stop1 .. stop3、step_count / dither_mode（v1.10。穴なし）
 obj.pixelshader(
   "ps_gradient", "object", { "object" },
   {
@@ -929,6 +982,8 @@ obj.pixelshader(
     mids[2][1], mids[2][2], mids[2][3], mids[2][4],
     mids[3][1], mids[3][2], mids[3][3], mids[3][4],
     stops[3],
+    math.floor((grad_steps or 0) + 0.5),   -- [v1.10] 段数（2 未満は連続）
+    grad_dither or 0,                      -- [v1.10] ディザ
   },
   "draw"
 )
